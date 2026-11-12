@@ -1,0 +1,291 @@
+#!/usr/bin/env python3
+"""free-llm: local CLI over the Free-LLM provider directory.
+
+Subcommands:
+  list [--category permanent|renewable|trial] [--openai-compatible] [--json]
+  show <slug-or-name>
+  models <slug-or-name>
+  opencode <slug-or-name> [--key-env VAR]   # print an opencode provider snippet
+  check <slug-or-name> [--key-env VAR] [--model ID] [--timeout S]
+
+check performs a real /chat/completions call for OpenAI-compatible providers.
+The key is read from the process environment (never from this repo) and is
+never printed. Exit code 0 = live completion received.
+
+Examples:
+  free-llm list --category permanent
+  free-llm show groq-cloud
+  free-llm opencode groq-cloud --key-env GROQ_API_KEY
+  free-llm check groq-cloud --key-env GROQ_API_KEY
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+CATALOG = ROOT / "providers.json"
+TIMEOUT = 30
+
+
+def load() -> dict:
+    if not CATALOG.exists():
+        sys.exit(f"catalog missing: {CATALOG} (run tools/build_catalog.py)")
+    return json.loads(CATALOG.read_text(encoding="utf-8"))
+
+
+def find(catalog: dict, needle: str) -> dict:
+    n = needle.strip().lower()
+    for p in catalog["providers"]:
+        if p["slug"].lower() == n or p["name"].lower() == n:
+            return p
+    for p in catalog["providers"]:
+        if n in p["slug"].lower() or n in p["name"].lower():
+            return p
+    sys.exit(f"no provider matching {needle!r}; try: free-llm list")
+
+
+# Curated env var aliases for providers whose key name is not derivable from
+# the provider name. Keeps `check` from grabbing an unrelated provider's key.
+PROVIDER_KEY_ALIASES = {
+    "groq": ["GROQ_API_KEY", "AI_GROQ_KEY"],
+    "openrouter": ["OPENROUTER_API_KEY"],
+    "llm7-io": ["LLM7_API_KEY"],
+    "google-ai-studio": ["GEMINI_API_KEY", "GOOGLE_API_KEY", "AI_GEMINI_KEY"],
+    "nvidia-nim": ["NVIDIA_API_KEY"],
+    "z-ai": ["Z_AI_API_KEY", "AI_ZHIPU_KEY", "ZHIPU_API_KEY"],
+    "zhipu-bigmodel": ["AI_ZHIPU_KEY", "ZHIPU_API_KEY"],
+    "cloudflare-workers-ai": ["CLOUDFLARE_API_TOKEN", "CLOUDFLARE_API_KEY"],
+    "aion-labs": ["AION_LABS"],
+    "kilo-ai-gateway": ["KILO_API_KEY"],
+    "ollama-cloud": ["OLLAMA_CLOUD_API_KEY"],
+    "nous-portal": ["NOUS_API_KEY"],
+    "modelscope": ["MODELSCOPE_API_KEY"],
+    "siliconflow": ["SILICONFLOW_API_KEY"],
+    "cohere": ["COHERE_API_KEY", "AI_COHERE_KEY"],
+    "mistral": ["MISTRAL_API_KEY", "AI_MISTRAL_KEY"],
+    "cerebras": ["CEREBRAS_API_KEY", "AI_CEREBRAS_KEY"],
+    "together": ["TOGETHER_API_KEY", "TOGETHERAI_API_KEY"],
+    "deepinfra": ["DEEPINFRA_API_KEY"],
+    "sambanova": ["SAMBANOVA_API_KEY", "AI_SAMBA_NOVA_KEY"],
+    "deepseek": ["DEEPSEEK_API_KEY"],
+    "xai": ["XAI_API_KEY"],
+    "ai-horde": ["AI_HORDE_API_KEY"],
+}
+
+
+def candidate_key_envs(p: dict) -> list[str]:
+    """Reasonable env var names for a provider key, most specific first."""
+    names = {p["name"], p["slug"].replace("-", "_")}
+    out = []
+    for n in names:
+        base = re.sub(r"[^A-Za-z0-9]+", "_", n).strip("_").upper()
+        out += [f"{base}_API_KEY", f"AI_{base}_KEY"]
+    out += PROVIDER_KEY_ALIASES.get(p["slug"], [])
+    seen, uniq = set(), []
+    for v in out:
+        if v not in seen:
+            seen.add(v)
+            uniq.append(v)
+    return uniq
+
+
+def _read_dotenv(key: str, path: Path | None = None) -> str:
+    """Last NON-EMPTY assignment for key in a dotenv file (duplicates-safe)."""
+    path = path or Path.home() / ".env"
+    if not path.exists():
+        return ""
+    val = ""
+    try:
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, _, v = line.partition("=")
+            if k.strip() != key:
+                continue
+            v = v.strip().strip('"').strip("'").strip()
+            if v:
+                val = v
+    except OSError:
+        return ""
+    return val
+
+
+def resolve_key(p: dict, explicit: str | None) -> tuple[str, str] | None:
+    """Return (source_label, key) from the environment, then ~/.env."""
+    vars_ = [explicit] if explicit else candidate_key_envs(p)
+    for v in vars_:
+        if not v:
+            continue
+        val = os.environ.get(v, "").strip()
+        if val and val not in ("YOUR_API_KEY", "YOUR_KEY", "..."):
+            return v, val
+    # Fall back to ~/.env so the CLI works on hosts where keys live only there.
+    for v in vars_:
+        if not v:
+            continue
+        val = _read_dotenv(v)
+        if val:
+            return f"~/.env:{v}", val
+    return None
+
+
+def cmd_list(cat: dict, args) -> int:
+    rows = cat["providers"]
+    if args.category:
+        rows = [p for p in rows if args.category in p["categories"]]
+    if args.openai_compatible:
+        rows = [p for p in rows if p["openai_compatible"]]
+    if args.json:
+        print(json.dumps(rows, indent=2, ensure_ascii=False))
+        return 0
+    print(f"{'slug':28} {'cat':22} {'card':5} {'oa':3} {'name':28} example model")
+    for p in rows:
+        cat_ = ",".join(p["categories"]) or "-"
+        card = "yes" if p["card_required"] else ("no" if p["card_required"] is False else "?")
+        oa = "yes" if p["openai_compatible"] else "no"
+        print(f"{p['slug']:28} {cat_:22} {card:5} {oa:3} {p['name']:28} {p['example_model'] or '-'}")
+    print(f"\n{len(rows)} providers")
+    return 0
+
+
+def cmd_show(cat: dict, args) -> int:
+    p = find(cat, args.provider)
+    print(json.dumps(p, indent=2, ensure_ascii=False))
+    return 0
+
+
+def cmd_models(cat: dict, args) -> int:
+    p = find(cat, args.provider)
+    for m in p["models"]:
+        print(m)
+    return 0
+
+
+def cmd_opencode(cat: dict, args) -> int:
+    p = find(cat, args.provider)
+    key_env = args.key_env or (candidate_key_envs(p)[0] if candidate_key_envs(p) else None)
+    model = args.model or p["example_model"]
+    if not model:
+        sys.exit(f"{p['slug']}: no model known; pass --model")
+    options = {"baseURL": p["base_url"]}
+    if key_env:
+        options["apiKey"] = "{env:" + key_env + "}"
+    block = {
+        p["slug"].replace("-", "_"): {
+            "npm": "@ai-sdk/openai-compatible",
+            "name": p["name"],
+            "options": options,
+            "models": {model: {"name": model}},
+        }
+    }
+    print(json.dumps(block, indent=2))
+    print(f"\n# {p['name']}: {p['base_url']}\n# key env: {key_env}\n# model: {model}")
+    return 0
+
+
+def _post(url: str, key: str, model: str, timeout: int) -> tuple[int, str]:
+    """POST a chat completion via curl (urllib is blocked by some edges)."""
+    body = json.dumps({
+        "model": model,
+        "messages": [{"role": "user", "content": "Reply with exactly: FREE_LLM_OK"}],
+        "max_tokens": 256,
+    })
+    try:
+        proc = subprocess.run(
+            ["curl", "-sS", "-m", str(timeout), "-w", "\n%{http_code}", url,
+             "-H", "Content-Type: application/json",
+             "-H", f"Authorization: Bearer {key}",
+             "-d", body],
+            capture_output=True, text=True, timeout=timeout + 10,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return 0, f"{type(exc).__name__}: {exc}"
+    out = (proc.stdout or "").strip()
+    if "\n" in out:
+        payload, _, status = out.rpartition("\n")
+    else:
+        payload, status = out, "0"
+    try:
+        code = int(status)
+    except ValueError:
+        code = 0
+    if code != 200:
+        return code, payload[:500]
+    try:
+        data = json.loads(payload)
+    except ValueError:
+        return 200, payload[:500]
+    if isinstance(data, dict) and data.get("error"):
+        return 400, json.dumps(data, ensure_ascii=False)[:500]
+    text = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+    return 200, text
+
+
+def cmd_check(cat: dict, args) -> int:
+    p = find(cat, args.provider)
+    if not p["openai_compatible"]:
+        print(f"{p['slug']}: not OpenAI-compatible (base {p['base_url']}); "
+              f"no automatic probe", file=sys.stderr)
+        return 2
+    resolved = resolve_key(p, args.key_env)
+    if not resolved:
+        print(f"{p['slug']}: no key in environment or ~/.env "
+              f"(tried: {', '.join(candidate_key_envs(p)[:6])}...)", file=sys.stderr)
+        return 78
+    source, key = resolved
+    model = args.model or p["example_model"]
+    if not model:
+        sys.exit(f"{p['slug']}: no model known; pass --model")
+    base = p["base_url"].rstrip("/")
+    url = base + "/chat/completions"
+    status, text = _post(url, key, model, args.timeout)
+    ok = status == 200 and "FREE_LLM_OK" in (text or "")
+    print(f"{p['slug']} | {model} | key={source} | HTTP {status} | "
+          f"{'OK' if ok else 'FAIL'}")
+    if not ok:
+        print((text or "")[:500], file=sys.stderr)
+    return 0 if ok else 1
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(prog="free-llm")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    pl = sub.add_parser("list")
+    pl.add_argument("--category", choices=["permanent", "renewable", "trial"])
+    pl.add_argument("--openai-compatible", action="store_true")
+    pl.add_argument("--json", action="store_true")
+
+    for name in ("show", "models"):
+        sp = sub.add_parser(name)
+        sp.add_argument("provider")
+
+    po = sub.add_parser("opencode")
+    po.add_argument("provider")
+    po.add_argument("--key-env")
+    po.add_argument("--model")
+
+    pc = sub.add_parser("check")
+    pc.add_argument("provider")
+    pc.add_argument("--key-env")
+    pc.add_argument("--model")
+    pc.add_argument("--timeout", type=int, default=TIMEOUT)
+
+    args = ap.parse_args()
+    cat = load()
+    handlers = {
+        "list": cmd_list, "show": cmd_show, "models": cmd_models,
+        "opencode": cmd_opencode, "check": cmd_check,
+    }
+    raise SystemExit(handlers[args.cmd](cat, args))
+
+
+if __name__ == "__main__":
+    main()
